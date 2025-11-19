@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -39,24 +40,19 @@ func main() {
 		limit = &countInt
 	}
 
-	var startId string
-	if *start != "" {
-		t, err := time.Parse(time.RFC3339, *start)
-		dieOnError(err, "bad start time")
-		startId = strconv.FormatInt(t.UnixMilli(), 10)
+	var nextBoundId string
+	if *start == "" {
+		nextBoundId = "$"
 	} else {
-		startId = strconv.FormatInt(time.Now().UnixMilli(), 10)
+		nextBoundId = prevMsgId(parseMsgId(*start)).String()
 	}
 
-	var endID *string
+	var endId *msgIdParsed
 	if *end != "" {
-		t, err := time.Parse(time.RFC3339, *end)
-		dieOnError(err, "bad end time")
-		s := strconv.FormatInt(t.UnixMilli(), 10)
-		endID = &s
+		parsedEndId := parseMsgId(*end)
+		endId = &parsedEndId
 	}
 
-	curID := startId
 	seen := 0
 	ctx := context.Background()
 
@@ -74,7 +70,7 @@ func main() {
 
 	for {
 		readRes, err := redisClient.XRead(ctx, &redis.XReadArgs{
-			Streams: []string{streamKey, curID},
+			Streams: []string{streamKey, nextBoundId},
 			Block: time.Second,
 			Count: 1000,
 		}).Result()
@@ -92,16 +88,12 @@ func main() {
 					return
 				}
 
-				curID = msg.ID
+				nextBoundId = msg.ID
+				msgIdParsed := parseMsgId(msg.ID)
 
-				if endID != nil && curID > *endID {
+				if endId != nil && compareMsgId(msgIdParsed, *endId) > 0 {
 					return
 				}
-
-				msgIdTsStr := strings.Split(curID, "-")[0]
-				msgIdTs, err := strconv.ParseInt(msgIdTsStr, 10, 64)
-				dieOnError(err, "bad msg id timestamp")
-				msgTime := time.UnixMilli(msgIdTs)
 
 				body := make(map[string]string)
 				for k, v := range msg.Values {
@@ -113,8 +105,8 @@ func main() {
 				}
 
 				out, _ := json.Marshal(map[string]any{
-					"id": curID,
-					"ts": msgTime.Format(time.RFC3339Nano),
+					"id": nextBoundId,
+					"ts": time.UnixMilli(int64(msgIdParsed.ts)).Format(time.RFC3339Nano),
 					"body": body,
 				})
 				fmt.Println(string(out))
@@ -122,6 +114,57 @@ func main() {
 			}
 		}
 	}
+}
+
+type msgIdParsed struct {
+	ts uint64
+	seq uint64
+}
+
+func (self msgIdParsed) String() string {
+	return fmt.Sprintf("%v-%v", self.ts, self.seq)
+}
+
+func parseMsgId(value string) msgIdParsed {
+	parts := strings.Split(value, "-")
+
+	ts, err := strconv.ParseUint(parts[0], 10, 64)
+	dieOnError(err, "bad msg ts")
+
+	var index uint64
+	if len(parts) >= 2 {
+		index, err = strconv.ParseUint(parts[1], 10, 64)
+		dieOnError(err, "bad msg index")
+	} else {
+		index = 0
+	}
+
+	return msgIdParsed{
+		ts: ts,
+		seq: index,
+	}
+}
+
+func compareMsgId(left msgIdParsed, right msgIdParsed) int {
+	if left.ts < right.ts {
+		return -1
+	}
+	if left.ts == right.ts {
+		if left.seq < right.seq {
+			return -1
+		}
+		if left.seq == right.seq {
+			return 0
+		}
+	}
+	return 1
+}
+
+func prevMsgId(value msgIdParsed) msgIdParsed {
+	if value.seq > 0 {
+		return msgIdParsed{ts: value.ts, seq: value.seq - 1}
+	}
+	return msgIdParsed{ts: value.ts - 1, seq: math.MaxUint64}
 }
 
 func dieOnError(err error, msg string) {
