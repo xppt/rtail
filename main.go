@@ -43,6 +43,8 @@ func main() {
 	var nextBoundId string
 	if *start == "" {
 		nextBoundId = "$"
+	} else if (*start == "+") {
+		nextBoundId = "+"
 	} else {
 		nextBoundId = prevMsgId(parseMsgId(*start)).String()
 	}
@@ -84,10 +86,6 @@ func main() {
 
 		for _, stream := range readRes {
 			for _, msg := range stream.Messages {
-				if limit != nil && seen >= *limit {
-					return
-				}
-
 				nextBoundId = msg.ID
 				msgIdParsed := parseMsgId(msg.ID)
 
@@ -111,6 +109,10 @@ func main() {
 				})
 				fmt.Println(string(out))
 				seen++
+
+				if limit != nil && seen >= *limit {
+					return
+				}
 			}
 		}
 	}
@@ -164,7 +166,10 @@ func prevMsgId(value msgIdParsed) msgIdParsed {
 	if value.seq > 0 {
 		return msgIdParsed{ts: value.ts, seq: value.seq - 1}
 	}
-	return msgIdParsed{ts: value.ts - 1, seq: math.MaxUint64}
+	if value.ts > 0 {
+		return msgIdParsed{ts: value.ts - 1, seq: math.MaxUint64}
+	}
+	return value
 }
 
 func dieOnError(err error, msg string) {
