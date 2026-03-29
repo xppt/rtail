@@ -128,7 +128,7 @@ func xReadChunk(
 		streamKey string, nextBoundId string, chunkLimit int64, follow bool,
 ) []redis.XMessage {
 
-	var blockTime time.Duration
+	blockTime := time.Duration(-1)
 	if follow {
 		blockTime = time.Second
 	}
