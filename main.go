@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"rtail/run_cli"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +18,10 @@ import (
 )
 
 func main() {
+	run_cli.RunCli(entryPoint)
+}
+
+func entryPoint() {
 	host := flag.String("h", "localhost", "")
 	port := flag.String("p", "6379", "")
 	user := flag.String("user", "", "")
@@ -24,6 +29,8 @@ func main() {
 	start := flag.String("start", "", "")
 	end := flag.String("end", "", "")
 	countFlag := flag.String("count", "", "")
+	followFlag := flag.Bool("follow", false, "")
+	base64Flag := flag.Bool("base64", false, "")
 	flag.Parse()
 
 	if flag.NArg() != 1 {
@@ -36,7 +43,7 @@ func main() {
 	var limit *int
 	if *countFlag != "" {
 		countInt, err := strconv.Atoi(*countFlag)
-		dieOnError(err, "bad count")
+		run_cli.DieOnError(err, "bad count")
 		limit = &countInt
 	}
 
@@ -71,51 +78,80 @@ func main() {
 	})
 
 	for {
-		readRes, err := redisClient.XRead(ctx, &redis.XReadArgs{
-			Streams: []string{streamKey, nextBoundId},
-			Block: time.Second,
-			Count: 1000,
-		}).Result()
+		const chunkLimit = 1000
 
-		if err != nil && err != redis.Nil {
-			dieOnError(err, "failed to read")
-		}
-		if err == redis.Nil {
-			continue
-		}
+		streamMsgs := xReadChunk(ctx, redisClient, streamKey, nextBoundId, chunkLimit, *followFlag)
 
-		for _, stream := range readRes {
-			for _, msg := range stream.Messages {
-				nextBoundId = msg.ID
-				msgIdParsed := parseMsgId(msg.ID)
+		for _, msg := range streamMsgs {
+			nextBoundId = msg.ID
+			msgIdParsed := parseMsgId(msg.ID)
 
-				if endId != nil && compareMsgId(msgIdParsed, *endId) > 0 {
-					return
+			if endId != nil && compareMsgId(msgIdParsed, *endId) > 0 {
+				return
+			}
+
+			body := make(map[string]string)
+			for key, value := range msg.Values {
+				b, ok := value.(string)
+				if !ok {
+					continue
 				}
 
-				body := make(map[string]string)
-				for k, v := range msg.Values {
-					b, ok := v.(string)
-					if !ok {
-						continue
-					}
-					body[k] = base64.StdEncoding.EncodeToString([]byte(b))
-				}
-
-				out, _ := json.Marshal(map[string]any{
-					"id": nextBoundId,
-					"ts": time.UnixMilli(int64(msgIdParsed.ts)).Format(time.RFC3339Nano),
-					"body": body,
-				})
-				fmt.Println(string(out))
-				seen++
-
-				if limit != nil && seen >= *limit {
-					return
+				if *base64Flag {
+					body[key] = base64.StdEncoding.EncodeToString([]byte(b))
+				} else {
+					body[key] = b
 				}
 			}
+
+			out, _ := json.Marshal(map[string]any{
+				"id": nextBoundId,
+				"ts": time.UnixMilli(int64(msgIdParsed.ts)).Format(time.RFC3339Nano),
+				"body": body,
+			})
+			fmt.Println(string(out))
+			seen++
+
+			if limit != nil && seen >= *limit {
+				return
+			}
+		}
+
+		if len(streamMsgs) < chunkLimit && !*followFlag {
+			break
 		}
 	}
+}
+
+func xReadChunk(
+		ctx context.Context, redisClient *redis.Client,
+		streamKey string, nextBoundId string, chunkLimit int64, follow bool,
+) []redis.XMessage {
+
+	var blockTime time.Duration
+	if follow {
+		blockTime = time.Second
+	}
+
+	readRes, err := redisClient.XRead(ctx, &redis.XReadArgs{
+		Streams: []string{streamKey, nextBoundId},
+		Block: blockTime,
+		Count: chunkLimit,
+	}).Result()
+
+	if err == redis.Nil {
+		return nil
+	}
+
+	run_cli.DieOnError(err, "failed to read")
+
+	if len(readRes) == 0 {
+		return nil
+	} else if len(readRes) != 1 {
+		run_cli.DieF("unexpected xread resp size")
+	}
+
+	return readRes[0].Messages
 }
 
 type msgIdParsed struct {
@@ -131,12 +167,12 @@ func parseMsgId(value string) msgIdParsed {
 	parts := strings.Split(value, "-")
 
 	ts, err := strconv.ParseUint(parts[0], 10, 64)
-	dieOnError(err, "bad msg ts")
+	run_cli.DieOnError(err, "bad msg ts")
 
 	var index uint64
 	if len(parts) >= 2 {
 		index, err = strconv.ParseUint(parts[1], 10, 64)
-		dieOnError(err, "bad msg index")
+		run_cli.DieOnError(err, "bad msg index")
 	} else {
 		index = 0
 	}
@@ -170,11 +206,4 @@ func prevMsgId(value msgIdParsed) msgIdParsed {
 		return msgIdParsed{ts: value.ts - 1, seq: math.MaxUint64}
 	}
 	return value
-}
-
-func dieOnError(err error, msg string) {
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s: %v\n", msg, err)
-		os.Exit(1)
-	}
 }
