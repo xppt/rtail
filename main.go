@@ -7,7 +7,6 @@ import (
 	"flag"
 	"fmt"
 	"math"
-	"os"
 	"rtail/run_cli"
 	"strconv"
 	"strings"
@@ -26,7 +25,7 @@ func entryPoint() {
 	port := flag.String("p", "6379", "")
 	user := flag.String("user", "", "")
 	pass := flag.String("pass", "", "")
-	start := flag.String("start", "", "")
+	start := flag.String("start", "$", "")
 	end := flag.String("end", "", "")
 	countFlag := flag.String("count", "", "")
 	followFlag := flag.Bool("follow", false, "")
@@ -34,8 +33,7 @@ func entryPoint() {
 	flag.Parse()
 
 	if flag.NArg() != 1 {
-		fmt.Fprintln(os.Stderr, "missing key")
-		os.Exit(1)
+		run_cli.Die("unexpected args")
 	}
 
 	streamKey := flag.Arg(0)
@@ -45,15 +43,6 @@ func entryPoint() {
 		countInt, err := strconv.Atoi(*countFlag)
 		run_cli.DieOnError(err, "bad count")
 		limit = &countInt
-	}
-
-	var nextBoundId string
-	if *start == "" {
-		nextBoundId = "$"
-	} else if (*start == "+") {
-		nextBoundId = "+"
-	} else {
-		nextBoundId = prevMsgId(parseMsgId(*start)).String()
 	}
 
 	var endId *msgIdParsed
@@ -77,10 +66,25 @@ func entryPoint() {
 		},
 	})
 
-	for {
-		const chunkLimit = 1000
+	xInfo, err := redisClient.XInfoStream(ctx, streamKey).Result()
+	run_cli.DieOnError(err, "xinfo stream for a key failed")
 
-		streamMsgs := xReadChunk(ctx, redisClient, streamKey, nextBoundId, chunkLimit, *followFlag)
+	var nextBoundId string
+	if (*start == "$") {
+		nextBoundId = xInfo.LastGeneratedID
+	} else if (*start == "+") {
+		nextBoundId = prevMsgId(parseMsgId(xInfo.LastGeneratedID)).String()
+	} else {
+		nextBoundId = prevMsgId(parseMsgId(*start)).String()
+	}
+
+	if endId == nil && !*followFlag {
+		parsedEndId := parseMsgId(xInfo.LastGeneratedID)
+		endId = &parsedEndId
+	}
+
+	for {
+		streamMsgs := xReadChunk(ctx, redisClient, streamKey, nextBoundId, *followFlag)
 
 		for _, msg := range streamMsgs {
 			nextBoundId = msg.ID
@@ -116,16 +120,12 @@ func entryPoint() {
 				return
 			}
 		}
-
-		if len(streamMsgs) < chunkLimit && !*followFlag {
-			break
-		}
 	}
 }
 
 func xReadChunk(
 		ctx context.Context, redisClient *redis.Client,
-		streamKey string, nextBoundId string, chunkLimit int64, follow bool,
+		streamKey string, nextBoundId string, follow bool,
 ) []redis.XMessage {
 
 	blockTime := time.Duration(-1)
@@ -136,7 +136,7 @@ func xReadChunk(
 	readRes, err := redisClient.XRead(ctx, &redis.XReadArgs{
 		Streams: []string{streamKey, nextBoundId},
 		Block: blockTime,
-		Count: chunkLimit,
+		Count: 1000,
 	}).Result()
 
 	if err == redis.Nil {
